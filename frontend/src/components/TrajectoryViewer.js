@@ -19,12 +19,12 @@ function TrajectoryViewer({ trajectory }) {
     scene.background = new THREE.Color(0x000000);
     sceneRef.current = scene;
 
-    // Create camera
+    // Create camera (far plane large so long predictions e.g. 26s are visible)
     const camera = new THREE.PerspectiveCamera(
       75,
       window.innerWidth / window.innerHeight,
       0.1,
-      1000
+      1000000
     );
     camera.position.set(5, 5, 10);
     camera.lookAt(0, 0, 0);
@@ -108,19 +108,25 @@ function TrajectoryViewer({ trajectory }) {
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
 
-    // Create line geometry
+    // Scale line/point size with trajectory extent so long predictions stay visible
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const lineWidth = Math.max(1, Math.min(3, maxDim * 0.002));
+    const pointRadius = Math.max(0.05, Math.min(0.5, maxDim * 0.01));
+
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
     const material = new THREE.LineBasicMaterial({
       color: 0x00ff00,
-      linewidth: 3
+      linewidth: lineWidth
     });
     const line = new THREE.Line(geometry, material);
     line.userData.isTrajectoryLine = true;
     sceneRef.current.add(line);
 
-    // Add spheres for each point
+    // Draw spheres: first point (red) + every 2nd point so ~1 circle per second (0.5s * 2)
+    const sphereStep = 2;
     points.forEach((point, index) => {
-      const sphereGeometry = new THREE.SphereGeometry(0.1, 16, 16);
+      if (index > 0 && index % sphereStep !== 0) return;
+      const sphereGeometry = new THREE.SphereGeometry(pointRadius, 16, 16);
       const sphereMaterial = new THREE.MeshBasicMaterial({ color: index === 0 ? 0xff0000 : 0x00ffff });
       const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
       sphere.position.copy(point);
@@ -130,7 +136,6 @@ function TrajectoryViewer({ trajectory }) {
 
     // Center camera on trajectory
     if (cameraRef.current && controlsRef.current) {
-      const maxDim = Math.max(size.x, size.y, size.z) || 10;
       const fov = cameraRef.current.fov * (Math.PI / 180);
       let cameraZ = maxDim / (2 * Math.tan(fov / 2));
       cameraZ *= 2.5; // Add padding

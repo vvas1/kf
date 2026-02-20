@@ -39,7 +39,9 @@ function App() {
   };
 
   return (
-    <div className="App">
+    <div className="App" style={{
+      display:"grid", gridTemplateColumns:"500px 1fr",
+    }}>
       <ControlPanel 
         onPredict={handlePredict} 
         isLoading={isLoading}

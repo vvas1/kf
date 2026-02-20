@@ -4,6 +4,12 @@ services:
     restart: unless-stopped
     expose:
       - "8080"
+    ports:
+      # UDP port range for WebRTC ICE candidates (libdatachannel portRangeBegin/End)
+      - "10000-10010:10000-10010/udp"
+    environment:
+      # Optional: set to stun:stun.l.google.com:19302 if backend is behind NAT
+      - STUN_SERVER=
     healthcheck:
       test: ["CMD", "sh", "-c", "echo '' | nc -w1 localhost 8080"]
       interval: 10s

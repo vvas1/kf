@@ -1,7 +1,13 @@
 import React, { useState } from 'react';
 import './ControlPanel.css';
 
-function ControlPanel({ onPredict, isLoading, error }) {
+const STATUS_STYLE = {
+  open:       { color: '#00ff88', label: '● Connected'    },
+  connecting: { color: '#ffaa00', label: '● Connecting…'  },
+  closed:     { color: '#ff4444', label: '● Disconnected' },
+};
+
+function ControlPanel({ onPredict, rtcStatus, error }) {
   const [duration, setDuration] = useState(10);
   const [measurements, setMeasurements] = useState([
     { x: 0, y: 0, z: 0 },
@@ -21,9 +27,9 @@ function ControlPanel({ onPredict, isLoading, error }) {
   };
 
   const updateMeasurement = (index, axis, value) => {
-    const newMeasurements = [...measurements];
-    newMeasurements[index][axis] = parseFloat(value) || 0;
-    setMeasurements(newMeasurements);
+    const updated = [...measurements];
+    updated[index][axis] = parseFloat(value) || 0;
+    setMeasurements(updated);
   };
 
   const handlePredict = () => {
@@ -34,9 +40,24 @@ function ControlPanel({ onPredict, isLoading, error }) {
     onPredict(measurements, duration);
   };
 
+  const { color, label } = STATUS_STYLE[rtcStatus] || STATUS_STYLE.closed;
+
   return (
     <div className="control-panel">
-      <h2>3D Trajectory Prediction</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h2>3D Trajectory Prediction</h2>
+        <span style={{
+          padding: '3px 10px',
+          borderRadius: '12px',
+          background: color + '22',
+          color,
+          fontSize: '12px',
+          fontWeight: 'bold',
+          whiteSpace: 'nowrap',
+        }}>
+          {label}
+        </span>
+      </div>
 
       <div className="input-group">
         <label>Prediction Duration (seconds):</label>
@@ -98,9 +119,9 @@ function ControlPanel({ onPredict, isLoading, error }) {
       <button
         onClick={handlePredict}
         className="predict-btn"
-        disabled={isLoading}
+        disabled={rtcStatus !== 'open'}
       >
-        {isLoading ? 'Predicting...' : 'Predict Trajectory'}
+        {rtcStatus === 'connecting' ? 'Connecting…' : 'Predict Trajectory'}
       </button>
 
       {error && <div className="error">{error}</div>}

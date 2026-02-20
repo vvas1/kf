@@ -2,23 +2,28 @@
 #include "json.hpp"
 #include "kalman_filter.hpp"
 #include "model_constant_accel.hpp"
+#include <rtc/rtc.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <future>
 #include <iostream>
-#include <stdexcept>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <string>
 #include <vector>
 
 using json = nlohmann::json;
 
-static constexpr double DT          = 1.0;
-static constexpr double MEASURE_VAR = 0.1;
-static constexpr double INITIAL_VAR = 1.0;
-static constexpr double PROCESS_VAR = 0.01;
+static constexpr double DT                         = 1.0;
+static constexpr double MEASURE_VAR                = 0.1;
+static constexpr double INITIAL_VAR                = 1.0;
+static constexpr double PROCESS_VAR                = 0.01;
 static constexpr double PROCESS_VAR_ACCEL_FALLBACK = 0.5;
 
-// Estimates acceleration process variance from position-only measurements via
-// finite differences: a ≈ (p_{k+2} - 2*p_{k+1} + p_k) / dt^2
 static double estimateProcessVarAccel(const std::vector<std::array<double, 3>>& pts, double dt) {
     if (pts.size() < 3 || dt <= 0.0)
         return PROCESS_VAR_ACCEL_FALLBACK;
@@ -82,6 +87,24 @@ static json predictTrajectory(double duration, const json& measurements) {
     return result;
 }
 
+// ── per-connection state ──────────────────────────────────────────────────────
+
+struct PeerSession {
+    std::shared_ptr<rtc::PeerConnection> pc;
+    std::shared_ptr<rtc::DataChannel>    dc;
+};
+
+static std::map<std::string, std::shared_ptr<PeerSession>> gSessions;
+static std::mutex                                           gMutex;
+
+static std::string genId() {
+    static std::mt19937 rng(std::random_device{}());
+    static std::uniform_int_distribution<int> dist(0, 15);
+    std::string id(16, '0');
+    for (auto& c : id) c = "0123456789abcdef"[dist(rng)];
+    return id;
+}
+
 static void setCORSHeaders(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Origin",  "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -89,29 +112,93 @@ static void setCORSHeaders(httplib::Response& res) {
 }
 
 int main() {
+    // Suppress libdatachannel verbose logs
+    rtc::InitLogger(rtc::LogLevel::Warning);
+
     httplib::Server svr;
 
-    svr.Options("/api/predict", [](const httplib::Request&, httplib::Response& res) {
+    svr.Options("/signal", [](const httplib::Request&, httplib::Response& res) {
         setCORSHeaders(res);
         res.status = 200;
     });
 
-    svr.Post("/api/predict", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/signal", [](const httplib::Request& req, httplib::Response& res) {
         setCORSHeaders(res);
         try {
-            auto body = json::parse(req.body);
-            const auto& meas = body.at("measurements");
-            if (meas.empty()) {
-                res.status = 400;
-                res.set_content("Measurements array cannot be empty", "text/plain");
+            auto body     = json::parse(req.body);
+            auto offerSdp = body.at("sdp").get<std::string>();
+
+            rtc::Configuration cfg;
+            cfg.portRangeBegin = 10000;
+            cfg.portRangeEnd   = 10010;
+
+            // Optional STUN server via env var (useful when backend is behind Docker NAT)
+            const char* stun = std::getenv("STUN_SERVER");
+            if (stun && *stun)
+                cfg.iceServers.emplace_back(std::string(stun));
+
+            auto pc      = std::make_shared<rtc::PeerConnection>(cfg);
+            auto session = std::make_shared<PeerSession>();
+            session->pc  = pc;
+
+            // Wait for full ICE gathering before returning answer (vanilla ICE)
+            auto gatherDone = std::make_shared<std::promise<std::string>>();
+            pc->onGatheringStateChange([pc, gatherDone](rtc::PeerConnection::GatheringState st) mutable {
+                if (st == rtc::PeerConnection::GatheringState::Complete)
+                    if (auto d = pc->localDescription())
+                        try { gatherDone->set_value(std::string(*d)); } catch (...) {}
+            });
+
+            pc->onDataChannel([session](std::shared_ptr<rtc::DataChannel> dc) mutable {
+                session->dc = dc;
+                dc->onMessage([dc](rtc::message_variant data) {
+                    auto* s = std::get_if<std::string>(&data);
+                    if (!s) return;
+                    try {
+                        auto msg  = json::parse(*s);
+                        auto type = msg.at("type").get<std::string>();
+                        if (type == "measurements" && dc->isOpen()) {
+                            auto pts = predictTrajectory(
+                                msg.value("duration", 10.0),
+                                msg.at("measurements"));
+                            json resp = {{"type", "trajectory"}, {"points", pts}};
+                            dc->send(resp.dump());
+                        }
+                    } catch (...) {}
+                });
+            });
+
+            std::string id = genId();
+            pc->onStateChange([id](rtc::PeerConnection::State st) {
+                if (st == rtc::PeerConnection::State::Closed    ||
+                    st == rtc::PeerConnection::State::Failed     ||
+                    st == rtc::PeerConnection::State::Disconnected) {
+                    std::lock_guard<std::mutex> lk(gMutex);
+                    gSessions.erase(id);
+                }
+            });
+
+            pc->setRemoteDescription(rtc::Description(offerSdp, rtc::Description::Type::Offer));
+            pc->setLocalDescription();
+
+            auto fut = gatherDone->get_future();
+            if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+                res.status = 504;
+                res.set_content("ICE gathering timeout", "text/plain");
                 return;
             }
-            double duration = body.at("duration").get<double>();
-            json response   = {{"points", predictTrajectory(duration, meas)}};
-            res.set_content(response.dump(), "application/json");
+
+            {
+                std::lock_guard<std::mutex> lk(gMutex);
+                gSessions[id] = session;
+            }
+
+            json answer = {{"type", "answer"}, {"sdp", fut.get()}};
+            res.set_content(answer.dump(), "application/json");
+
         } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(std::string("Invalid request body: ") + e.what(), "text/plain");
+            res.status = 500;
+            res.set_content(std::string("Signal error: ") + e.what(), "text/plain");
         }
     });
 
